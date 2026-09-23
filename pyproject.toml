@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tracewhys"
+dynamic = ["version"]
+description = "Collection of tools for trace-wise analysis of chromatin tracing data"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Dmitry Mylarshchikov" }]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.4.3",
+    "pandas>=3.0.2",
+    "scipy>=1.17.1",
+    "pyarrow>=25.0.0",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+[project.urls]
+Homepage = "https://github.com/dmitrymyl/tracewhys"
+Issues = "https://github.com/dmitrymyl/tracewhys/issues"
+
+[tool.hatch.version]
+path = "src/tracewhys/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tracewhys"]
