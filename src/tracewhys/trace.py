@@ -144,6 +144,76 @@ class Trace:
             self._timepoint_mask = (~self._original_df[self._coord_cols[0]].isna()).to_numpy()
         return self._timepoint_mask
 
+    @property
+    def original_present_count(self) -> int:
+        """Number of timepoints present in the original input.
+
+        Returns:
+            int: Count of timepoints that had coordinate data before imputation.
+        """
+        return int(self.original_timepoint_mask.sum())
+
+    @property
+    def original_missing_count(self) -> int:
+        """Number of timepoints missing in the original input.
+
+        Returns:
+            int: Count of timepoints that were missing before imputation.
+        """
+        return int((~self.original_timepoint_mask).sum())
+
+    @property
+    def has_original_missing_left_edge(self) -> bool:
+        """Whether the first timepoint was missing in the original input.
+
+        Returns:
+            bool: True if the coordinate at the first timepoint was missing before
+                imputation, False otherwise.
+        """
+        return not self.original_timepoint_mask[0]
+
+    @property
+    def has_original_missing_right_edge(self) -> bool:
+        """Whether the last timepoint was missing in the original input.
+
+        Returns:
+            bool: True if the coordinate at the last timepoint was missing before
+                imputation, False otherwise.
+        """
+        return not self.original_timepoint_mask[-1]
+
+    @property
+    def has_original_missing_left_flank(self) -> bool:
+        """Whether the first two timepoints were both missing in the original input.
+
+        Returns:
+            bool: True if both the first and second timepoints were missing before
+                imputation, False otherwise.
+        """
+        return not self.original_timepoint_mask[0] and not self.original_timepoint_mask[1]
+
+    @property
+    def has_original_missing_right_flank(self) -> bool:
+        """Whether the last two timepoints were both missing in the original input.
+
+        Returns:
+            bool: True if both the penultimate and last timepoints were missing before
+                imputation, False otherwise.
+        """
+        return not self.original_timepoint_mask[-2] and not self.original_timepoint_mask[-1]
+
+    @property
+    def has_original_consecutive_missing_timepoints(self) -> bool:
+        """Whether the original input contains consecutive missing timepoints.
+
+        Returns:
+            bool: True if there exists at least one pair of adjacent timepoints both
+                missing before imputation, False otherwise.
+        """
+        missing = ~self.original_timepoint_mask
+        adjacent_missing_pairs = missing[:-1] & missing[1:]
+        return bool(adjacent_missing_pairs.any())
+
     def _impute(self) -> pd.DataFrame:
         """Linearly impute interior missing coordinates in the original dataframe.
 
@@ -270,7 +340,9 @@ class RnaTrace(Trace):
 
     Notes:
         - See `Trace` for the shared single-run behavior: imputation,
-          `original_timepoint_mask`, `gyration_radius`, `distance_matrix`, etc.
+          `original_timepoint_mask`, dropout indicators (`original_missing_count`,
+          `has_original_missing_left_edge`, ...), `gyration_radius`,
+          `distance_matrix`, etc.
         - Metric properties return `numpy.nan` when required coordinates are missing.
     """
     def __init__(self,
@@ -296,76 +368,6 @@ class RnaTrace(Trace):
         super().__init__(df, valid_timepoints, dim=dim, impute=impute)
         self.metadata: dict | None = metadata
         self._convex_hull: ConvexHull | None = None
-
-    @property
-    def original_present_count(self) -> int:
-        """Number of timepoints present in the original input.
-
-        Returns:
-            int: Count of timepoints that had coordinate data before imputation.
-        """
-        return int(self.original_timepoint_mask.sum())
-
-    @property
-    def original_missing_count(self) -> int:
-        """Number of timepoints missing in the original input.
-
-        Returns:
-            int: Count of timepoints that were missing before imputation.
-        """
-        return int((~self.original_timepoint_mask).sum())
-
-    @property
-    def has_original_missing_left_edge(self) -> bool:
-        """Whether the first timepoint was missing in the original input.
-
-        Returns:
-            bool: True if the coordinate at the first timepoint was missing before
-                imputation, False otherwise.
-        """
-        return not self.original_timepoint_mask[0]
-
-    @property
-    def has_original_missing_right_edge(self) -> bool:
-        """Whether the last timepoint was missing in the original input.
-
-        Returns:
-            bool: True if the coordinate at the last timepoint was missing before
-                imputation, False otherwise.
-        """
-        return not self.original_timepoint_mask[-1]
-
-    @property
-    def has_original_missing_left_flank(self) -> bool:
-        """Whether the first two timepoints were both missing in the original input.
-
-        Returns:
-            bool: True if both the first and second timepoints were missing before
-                imputation, False otherwise.
-        """
-        return not self.original_timepoint_mask[0] and not self.original_timepoint_mask[1]
-
-    @property
-    def has_original_missing_right_flank(self) -> bool:
-        """Whether the last two timepoints were both missing in the original input.
-
-        Returns:
-            bool: True if both the penultimate and last timepoints were missing before
-                imputation, False otherwise.
-        """
-        return not self.original_timepoint_mask[-2] and not self.original_timepoint_mask[-1]
-
-    @property
-    def has_original_consecutive_missing_timepoints(self) -> bool:
-        """Whether the original input contains consecutive missing timepoints.
-
-        Returns:
-            bool: True if there exists at least one pair of adjacent timepoints both
-                missing before imputation, False otherwise.
-        """
-        missing = ~self.original_timepoint_mask
-        adjacent_missing_pairs = missing[:-1] & missing[1:]
-        return bool(adjacent_missing_pairs.any())
 
     @property
     def half_extent_asymmetry(self) -> float:
@@ -628,10 +630,10 @@ class RnaTrace(Trace):
 class SisterTrace:
     """Handles coordinate measurements for a pair of sister-chromatid traces.
 
-    Composed of four `Trace` segments: sister1/sister2, each split into a
-    left and right side relative to the DNA-repair cut site. Every segment
+    Composed of four `Trace` subtraces: sister1/sister2, each split into a
+    left and right side relative to the DNA-repair cut site. Every subtrace
     has its own set of valid timepoints, and missing coordinates are imputed
-    only within a segment -- never across the cut site or between sisters.
+    only within a subtrace -- never across the cut site or between sisters.
 
     Args:
         df (pd.DataFrame): Input coordinate measurements with a `timepoint`
@@ -647,13 +649,14 @@ class SisterTrace:
             right of the cut site.
         dim (str): Coordinate dimensionality, either '2d' or '3d'.
         impute (bool): If True, linearly impute interior missing coordinates
-            within each segment.
+            within each subtrace.
         metadata (dict | None): Optional metadata for the trace.
 
     Attributes:
         df (pd.DataFrame): Combined dataframe (concatenation of the four
-            segments' data, sorted by timepoint), with `sister` and `side`
-            columns tagging each row.
+            subtraces' data, sorted by timepoint), with `sister` and `side`
+            columns tagging each row and an `original_present` column
+            marking rows present before imputation.
         dim (str): Coordinate dimensionality ('2d' or '3d').
         metadata (dict | None): Trace metadata if provided.
     """
@@ -683,7 +686,7 @@ class SisterTrace:
         }
         self._validate_structure(df, valid_timepoints_by_key)
 
-        self._segments: dict[tuple[str, str], Trace] = {
+        self._subtraces: dict[tuple[str, str], Trace] = {
             key: Trace(df[df['timepoint'].isin(tps)], tps, dim=dim, impute=impute)
             for key, tps in valid_timepoints_by_key.items()
         }
@@ -697,12 +700,12 @@ class SisterTrace:
                             df: pd.DataFrame,
                             valid_timepoints_by_key: dict[tuple[str, str], Sequence[int]],
                            ) -> None:
-        """Validate the input dataframe and the four timepoint segments.
+        """Validate the input dataframe and the four timepoint subtraces.
 
         Raises:
             ValueError: If required columns are missing, a timepoint is
-                assigned to more than one sister/side segment, or `df`
-                contains timepoints outside all four segments.
+                assigned to more than one sister/side subtrace, or `df`
+                contains timepoints outside all four subtraces.
         """
         failure_reasons = list()
 
@@ -717,7 +720,7 @@ class SisterTrace:
             overlapping_tps |= (seen_tps & tps_set)
             seen_tps |= tps_set
         if overlapping_tps:
-            failure_reasons.append(f'timepoints assigned to more than one sister/side segment: '
+            failure_reasons.append(f'timepoints assigned to more than one sister/side subtrace: '
                                    f'{sorted(overlapping_tps)}')
 
         unexp_tps = set(df['timepoint'].values) - seen_tps
@@ -728,19 +731,22 @@ class SisterTrace:
             raise ValueError(failure_reasons)
 
     def _build_combined_df(self) -> pd.DataFrame:
-        """Concatenate the four segments' data into one dataframe, tagged by segment.
+        """Concatenate the four subtraces' data into one dataframe, tagged by subtrace.
 
         Returns:
-            pd.DataFrame: Rows from all four segments, sorted by timepoint,
-                with `sister` and `side` columns identifying segment membership.
+            pd.DataFrame: Rows from all four subtraces, sorted by timepoint,
+                with `sister` and `side` columns identifying subtrace membership
+                and an `original_present` column holding each subtrace's
+                `original_timepoint_mask`.
         """
         parts = []
-        for (sister, side), segment in self._segments.items():
-            part = segment.df.copy()
+        for (sister, side), subtrace in self._subtraces.items():
+            part = subtrace.df.copy()
             if 'timepoint' not in part.columns:
                 part = part.reset_index()
             part['sister'] = sister
             part['side'] = side
+            part['original_present'] = subtrace.original_timepoint_mask
             parts.append(part)
         return pd.concat(parts).sort_values('timepoint').reset_index(drop=True)
 
@@ -765,6 +771,122 @@ class SisterTrace:
             df = df[df['side'] == side]
         return df
 
+    def _select_subtraces(self, sister: str = 'both', side: str = 'both') -> list[Trace]:
+        """Return the subtraces matching a `sister`/`side` selection.
+
+        Raises:
+            ValueError: If `sister` or `side` is not a valid selector.
+        """
+        self._validate_sister_side(sister, side)
+        return [subtrace for (sub_sister, sub_side), subtrace in self._subtraces.items()
+                if sister in ('both', sub_sister) and side in ('both', sub_side)]
+
+    @property
+    def original_timepoint_mask(self) -> NDArray[np.bool_]:
+        """Boolean mask of the original timepoint presence before imputation.
+
+        Returns:
+            np.ndarray: 1-D boolean array aligned with the rows of `df` (and
+                therefore with `distance_matrix`). True indicates the coordinate
+                was present in the original pre-imputation input.
+        """
+        return self.df['original_present'].to_numpy(dtype=bool)
+
+    def get_original_timepoint_mask(self, sister: str = 'both', side: str = 'both') -> NDArray[np.bool_]:
+        """Original timepoint-presence mask for a sister/side subset of the trace.
+
+        Args:
+            sister: One of "both", "sister1", "sister2".
+            side: One of "both", "left", "right".
+
+        Returns:
+            np.ndarray: 1-D boolean array aligned with the rows of the selected
+                subset of `df`, sorted by timepoint.
+        """
+        return self._subset_df(sister, side)['original_present'].to_numpy(dtype=bool)
+
+    @property
+    def original_present_count(self) -> int:
+        """Number of timepoints present in the original input, over all four subtraces."""
+        return self.get_original_present_count()
+
+    @property
+    def original_missing_count(self) -> int:
+        """Number of timepoints missing in the original input, over all four subtraces."""
+        return self.get_original_missing_count()
+
+    def get_original_present_count(self, sister: str = 'both', side: str = 'both') -> int:
+        """Number of originally present timepoints in a sister/side subset.
+
+        Args:
+            sister: One of "both", "sister1", "sister2".
+            side: One of "both", "left", "right".
+
+        Returns:
+            int: Count of timepoints that had coordinate data before imputation.
+        """
+        return sum(subtrace.original_present_count
+                   for subtrace in self._select_subtraces(sister, side))
+
+    def get_original_missing_count(self, sister: str = 'both', side: str = 'both') -> int:
+        """Number of originally missing timepoints in a sister/side subset.
+
+        Args:
+            sister: One of "both", "sister1", "sister2".
+            side: One of "both", "left", "right".
+
+        Returns:
+            int: Count of timepoints that were missing before imputation.
+        """
+        return sum(subtrace.original_missing_count
+                   for subtrace in self._select_subtraces(sister, side))
+
+    @property
+    def has_original_consecutive_missing_timepoints(self) -> bool:
+        """Whether any subtrace contains consecutive missing timepoints in the original input.
+
+        Adjacency is evaluated within each subtrace only -- never across the cut
+        site or between sisters.
+
+        Returns:
+            bool: True if at least one subtrace has a pair of adjacent timepoints
+                both missing before imputation, False otherwise.
+        """
+        return any(subtrace.has_original_consecutive_missing_timepoints
+                   for subtrace in self._subtraces.values())
+
+    @property
+    def has_remaining_missing_segments(self) -> bool:
+        """Whether any coordinate in any subtrace remains missing after imputation."""
+        return self.get_has_remaining_missing()
+
+    @property
+    def has_remaining_missing_edges(self) -> bool:
+        """Whether any subtrace's first or last coordinate remains missing after imputation."""
+        return self.get_has_remaining_missing(edges_only=True)
+
+    def get_has_remaining_missing(self,
+                                  sister: str = 'both',
+                                  side: str = 'both',
+                                  edges_only: bool = False,
+                                 ) -> bool:
+        """Whether coordinates in a sister/side subset remain missing after imputation.
+
+        Args:
+            sister: One of "both", "sister1", "sister2".
+            side: One of "both", "left", "right".
+            edges_only: If True, only check each selected subtrace's first and
+                last coordinates; otherwise check all coordinates.
+
+        Returns:
+            bool: True if any selected subtrace still contains NaN coordinates
+                (at its edges, if `edges_only`), False otherwise.
+        """
+        subtraces = self._select_subtraces(sister, side)
+        if edges_only:
+            return any(subtrace._has_remaining_missing_edges for subtrace in subtraces)
+        return any(subtrace._has_remaining_missing_segments for subtrace in subtraces)
+
     def get_gyration_radius(self, sister: str = 'both', side: str = 'both') -> float:
         """Radius of gyration for a sister/side subset of the trace.
 
@@ -778,13 +900,13 @@ class SisterTrace:
         """
         self._validate_sister_side(sister, side)
         if sister != 'both' and side != 'both':
-            return self._segments[(sister, side)].gyration_radius
+            return self._subtraces[(sister, side)].gyration_radius
         subset_df = self._subset_df(sister, side)
         return Trace._compute_gyration_radius(subset_df[self._coord_cols].to_numpy())
 
     @property
     def distance_matrix(self) -> NDArray[np.float64]:
-        """Pairwise Euclidean distance matrix across all four segments.
+        """Pairwise Euclidean distance matrix across all four subtraces.
 
         Returns:
             np.ndarray: Symmetric (n x n) matrix of pairwise distances.
@@ -821,16 +943,16 @@ class SisterTrace:
         """Pairwise distances between the four cut-adjacent endpoints.
 
         The four points are the timepoint nearest the cut site on each of the
-        four segments: the last timepoint of each `left` segment and the
-        first timepoint of each `right` segment.
+        four subtraces: the last timepoint of each `left` subtrace and the
+        first timepoint of each `right` subtrace.
 
         Returns:
             np.ndarray: Symmetric (4 x 4) matrix of pairwise distances, in the
                 order sister1-left, sister1-right, sister2-left, sister2-right.
         """
         if self._cut_end_dist_mtx is None:
-            keys = list(self._segments)
-            coords = np.stack([getattr(self._segments[key], self._CUT_EDGE_ATTR[key[1]])
+            keys = list(self._subtraces)
+            coords = np.stack([getattr(self._subtraces[key], self._CUT_EDGE_ATTR[key[1]])
                                for key in keys])
             self._cut_end_dist_mtx = squareform(pdist(coords, metric='euclidean'))
         return self._cut_end_dist_mtx
