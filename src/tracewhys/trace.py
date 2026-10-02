@@ -565,33 +565,51 @@ class RnaTrace(Trace):
                 Defaults to ``np.nanmedian``.
 
         Returns:
-            pd.DataFrame: DataFrame with columns ``separation`` and ``dist``.
+            pd.DataFrame: DataFrame with columns ``separation``, ``dist``,
+                ``n_pairs`` and ``n_missing``. ``n_pairs`` is the total number of
+                pairs at that separation, regardless of missingness (1 per row in
+                the non-aggregated modes). ``n_missing`` is the number of those
+                pairs in which at least one segment was missing in the original
+                input (before imputation).
         """
         mtx = self.distance_matrix
         n = mtx.shape[0]
+        orig_missing = ~self.original_timepoint_mask
+
         if mode == 'anchor_5':
-            records = [{'separation': sep, "dist": mtx[0, sep]}
+            records = [{'separation': sep,
+                        'dist': mtx[0, sep],
+                        'n_pairs': 1,
+                        'n_missing': int(orig_missing[0] | orig_missing[sep])}
                        for sep in range(1, n)]
+            df = pd.DataFrame.from_records(records)
+
         elif mode == 'anchor_3':
-            records = [{'separation': sep, "dist": mtx[-1, n - 1 - sep]}
+            records = [{'separation': sep,
+                        'dist': mtx[-1, n - 1 - sep],
+                        'n_pairs': 1,
+                        'n_missing': int(orig_missing[-1] | orig_missing[n - 1 - sep])}
                        for sep in range(1, n)]
+            df = pd.DataFrame.from_records(records)
+
+        elif mode in ('all', 'agg'):
+            df = pd.concat([pd.DataFrame({'separation': sep,
+                                          'dist': mtx.diagonal(sep),
+                                          'n_pairs': 1,
+                                          'n_missing': orig_missing[:-sep] | orig_missing[sep:]})
+                            for sep in range(1, n)],
+                           ignore_index=True)
+            df['n_missing'] = df['n_missing'].astype(int)
+
+            if mode == 'agg':
+                df = (df.groupby('separation', as_index=False)
+                        .agg({'dist': agg_func or np.nanmedian,
+                              'n_pairs': 'sum',
+                              'n_missing': 'sum'}))
         else:
-            sep_to_dist = {sep: mtx.diagonal(sep)
-                           for sep in range(1, n)}
-            if mode == 'all':
-                records = [{'separation': sep, "dist": dist}
-                           for sep, dists in sep_to_dist.items()
-                           for dist in dists]
-            elif mode == 'agg':
-                if agg_func is None:
-                    agg_func = np.nanmedian
-                records = [{'separation': sep, "dist": agg_func(dists)}
-                           for sep, dists in sep_to_dist.items()]
-            else:
-                raise ValueError(f'`mode` must be one of "anchor_5", "anchor_3", "all", "agg", '
-                                 f'but "{mode}" was provided.'
-                                )
-        return pd.DataFrame.from_records(records)
+            raise ValueError(f'`mode` must be one of "anchor_5", "anchor_3", "all", "agg", '
+                             f'but "{mode}" was provided.')
+        return df
 
     def get_all_metrics(self):
         """Compute and return all available metrics for the trace."""
