@@ -45,16 +45,33 @@ class Trace:
         valid_timepoints (Sequence): Ordered list/array of expected timepoints.
         dim (str): Coordinate dimensionality, either '2d' or '3d'.
         impute (bool): If True, linearly impute interior missing coordinates.
+            Defaults to False: an imputed spot lies on the straight line between
+            its neighbours, which shortens its distances to them and biases
+            distance-based metrics.
+        missing (str): How metrics treat coordinates that are still missing
+            after imputation (if any). 'nan' (default): a metric that uses a
+            missing spot is `numpy.nan`. 'skip': missing spots are left out and
+            metrics are computed from the remaining spots (see `RnaTrace`).
+        min_spots (int): In 'skip' mode, the minimum number of spots with a
+            position (detected, or imputed when `impute=True`) needed for
+            metrics computed over the spot cloud; below it they are `numpy.nan`.
 
     Attributes:
         original_timepoint_mask (np.ndarray): Boolean mask per timepoint indicating
             whether a coordinate was present in the original pre-imputation input.
         df (pd.DataFrame): Working dataframe (imputed if `impute=True`).
         dim (str): Coordinate dimensionality ('2d' or '3d').
+        missing (str): Missing-spot mode, 'nan' or 'skip'.
+        min_spots (int): Minimum number of spots for 'skip'-mode metrics.
 
     Notes:
         - Properties prefixed with `original_` refer to the pre-imputation state.
-        - Metric properties return `numpy.nan` when required coordinates are missing.
+        - Metric properties return `numpy.nan` when required coordinates are missing
+          (`missing='nan'`), or when too few spots remain (`missing='skip'`).
+        - In 'skip' mode, a trace missing an end spot covers a shorter stretch of
+          the molecule, so size-type metrics (radius of gyration, convex hull) are
+          systematically smaller than for a complete trace. Pooling partial and
+          complete traces mixes these populations.
         - Private helpers and cached attributes are named with a leading underscore and
           are implementation details (not part of the public API).
     """
@@ -62,7 +79,9 @@ class Trace:
                  df: pd.DataFrame,
                  valid_timepoints: Sequence[int],
                  dim: Literal['2d', '3d'] = '2d',
-                 impute: bool = True,
+                 impute: bool = False,
+                 missing: Literal['nan', 'skip'] = 'nan',
+                 min_spots: int = 3,
                 ) -> None:
         """Create a trace run from coordinate measurements.
 
@@ -71,14 +90,23 @@ class Trace:
             valid_timepoints: Expected ordered timepoints for the trace.
             dim: Coordinate dimensionality, either ``"2d"`` or ``"3d"``.
             impute: Whether to linearly impute missing interior coordinates.
+            missing: Missing-spot mode, either ``"nan"`` or ``"skip"``.
+            min_spots: Minimum number of spots for ``"skip"``-mode metrics.
 
         Raises:
-            ValueError: If ``dim`` is invalid or required columns/timepoints are
-                missing or unexpected.
+            ValueError: If ``dim`` or ``missing`` is invalid, ``min_spots`` is
+                below 2, or required columns/timepoints are missing or unexpected.
         """
+        if missing not in ('nan', 'skip'):
+            raise ValueError(f'`missing` must be "nan" or "skip", but "{missing}" was provided.')
+        if min_spots < 2:
+            raise ValueError(f'`min_spots` must be at least 2, but {min_spots} was provided.')
+
         self._valid_timepoints: Sequence[int] = valid_timepoints
         self._coord_cols: list[str] = _coord_cols_for_dim(dim)
         self.dim: Literal['2d', '3d'] = dim
+        self.missing: Literal['nan', 'skip'] = missing
+        self.min_spots: int = min_spots
 
         self._validate_structure(df)
         self._original_df: pd.DataFrame = self._reindex_to_valid_timepoints(df)
@@ -161,6 +189,19 @@ class Trace:
             int: Count of timepoints that were missing before imputation.
         """
         return int((~self.original_timepoint_mask).sum())
+
+    @property
+    def is_complete(self) -> bool:
+        """Whether every timepoint was present in the original input.
+
+        For a complete trace, metrics do not depend on `impute` or `missing`,
+        so selecting complete traces after computing metrics in any mode gives
+        the full-trace-only analysis.
+
+        Returns:
+            bool: True if no timepoint was missing before imputation.
+        """
+        return bool(self.original_timepoint_mask.all())
 
     @property
     def has_original_missing_left_edge(self) -> bool:
@@ -270,6 +311,43 @@ class Trace:
         """
         return bool(np.isnan(self._coords).any())
 
+    @property
+    def placed_timepoint_mask(self) -> NDArray[np.bool_]:
+        """Boolean mask of timepoints that have a position in the current `df`.
+
+        Returns:
+            np.ndarray: 1-D boolean array with length equal to the number of valid
+                timepoints. True indicates the coordinate was detected or, when
+                `impute=True`, imputed.
+        """
+        return ~np.isnan(self._coords).any(axis=1)
+
+    @property
+    def placed_count(self) -> int:
+        """Number of timepoints that have a position in the current `df`.
+
+        Returns:
+            int: Count of detected spots, plus imputed spots when `impute=True`.
+        """
+        return int(self.placed_timepoint_mask.sum())
+
+    @property
+    def _metric_coords(self) -> NDArray[np.float64] | None:
+        """Coordinates used by metrics computed over the whole spot cloud.
+
+        Returns:
+            np.ndarray or None: In 'nan' mode, all coordinates, or None if any is
+                missing. In 'skip' mode, the coordinates of the placed spots, or
+                None if there are fewer than `min_spots` of them.
+        """
+        if self.missing == 'skip':
+            if self.placed_count < self.min_spots:
+                return None
+            return self._coords[self.placed_timepoint_mask]
+        if self._has_remaining_missing_segments:
+            return None
+        return self._coords
+
     @staticmethod
     def _has_missing_values(arr: ArrayLike) -> bool:
         """Check whether the array contains any missing (NaN) values.
@@ -306,10 +384,12 @@ class Trace:
 
         Returns:
             float: Computed radius of gyration, or `numpy.nan` if any timepoints
-                are missing from the current `df`.
+                are missing from the current `df` ('nan' mode) or fewer than
+                `min_spots` are placed ('skip' mode, computed over placed spots).
         """
         if self._gyration_radius is None:
-            self._gyration_radius = self._compute_gyration_radius(self._coords)
+            coords = self._metric_coords
+            self._gyration_radius = np.nan if coords is None else self._compute_gyration_radius(coords)
         return float(self._gyration_radius)
 
     @property
@@ -317,7 +397,9 @@ class Trace:
         """Pairwise Euclidean distance matrix between timepoints.
 
         Returns:
-            np.ndarray: Symmetric (n x n) matrix of pairwise distances.
+            np.ndarray: Symmetric (n x n) matrix of pairwise distances, aligned
+                with the valid timepoints. Rows and columns of missing spots are
+                `numpy.nan`.
         """
         if self._distance_matrix is None:
             self._distance_matrix = squareform(pdist(self._coords, metric='euclidean'))
@@ -333,6 +415,9 @@ class RnaTrace(Trace):
         valid_timepoints (Sequence): Ordered list/array of expected timepoints.
         dim (str): Coordinate dimensionality, either '2d' or '3d'.
         impute (bool): If True, linearly impute interior missing coordinates.
+            Defaults to False (see `Trace`).
+        missing (str): Missing-spot mode, 'nan' (default) or 'skip' (see `Trace`).
+        min_spots (int): Minimum number of spots for 'skip'-mode metrics.
         metadata (TraceMetadata | None): Optional metadata for the trace.
 
     Attributes:
@@ -344,13 +429,29 @@ class RnaTrace(Trace):
           `has_original_missing_left_edge`, ...), `gyration_radius`,
           `distance_matrix`, etc.
         - Metric properties return `numpy.nan` when required coordinates are missing.
+        - With `missing='skip'`, each metric uses the spots it can:
+            - `gyration_radius`, `asphericity` and the convex hull: the placed
+              spots, if there are at least `min_spots` (the hull also needs 3
+              non-collinear spots in 2D, 4 non-coplanar in 3D);
+            - `scaling_exponent`: the pairs of placed spots, at their separation
+              along the trace (not their rank among the placed spots);
+            - `half_extent_asymmetry`: the placed spots of each half, with halves
+              still defined by position along the trace; needs at least 2 placed
+              spots per half;
+            - `end_to_end_distance` and `contour_length` stay `numpy.nan` when an
+              end spot (respectively, any spot) is missing, since skipping a spot
+              would shorten them.
+        - To restrict an analysis to full traces, select the rows of
+          `get_all_metrics()` whose `complete` column is True (see `is_complete`).
     """
     def __init__(self,
                  df: pd.DataFrame,
                  valid_timepoints: Sequence[int],
                  dim: Literal['2d', '3d'] = '2d',
-                 impute: bool = True,
+                 impute: bool = False,
                  metadata: dict | None = None,
+                 missing: Literal['nan', 'skip'] = 'nan',
+                 min_spots: int = 3,
                 ) -> None:
         """Create an RNA trace from coordinate measurements.
 
@@ -360,12 +461,15 @@ class RnaTrace(Trace):
             dim: Coordinate dimensionality, either ``"2d"`` or ``"3d"``.
             impute: Whether to linearly impute missing interior coordinates.
             metadata: Optional trace metadata.
+            missing: Missing-spot mode, either ``"nan"`` or ``"skip"``.
+            min_spots: Minimum number of spots for ``"skip"``-mode metrics.
 
         Raises:
-            ValueError: If ``dim`` is invalid or required columns/timepoints are
-                missing or unexpected.
+            ValueError: If ``dim`` or ``missing`` is invalid, ``min_spots`` is
+                below 2, or required columns/timepoints are missing or unexpected.
         """
-        super().__init__(df, valid_timepoints, dim=dim, impute=impute)
+        super().__init__(df, valid_timepoints, dim=dim, impute=impute,
+                         missing=missing, min_spots=min_spots)
         self.metadata: dict | None = metadata
         self._convex_hull: ConvexHull | None = None
 
@@ -385,17 +489,25 @@ class RnaTrace(Trace):
         negative values indicate the left half is more extended. Values are
         typically in the range (-1, 1) when radii are positive and finite.
 
+        In 'skip' mode the halves are still split by position along the trace,
+        and each Rg is computed over the placed spots of its half.
+
         Returns:
             float: The half-extent asymmetry, or ``numpy.nan`` if the metric
-                cannot be computed because of missing coordinates. If both
-                radii are zero the result is undefined.
+                cannot be computed because of missing coordinates ('nan' mode)
+                or because a half has fewer than 2 placed spots ('skip' mode).
+                If both radii are zero the result is undefined.
         """
-        if self._has_remaining_missing_segments:
+        if self.missing == 'nan' and self._has_remaining_missing_segments:
             return np.nan
         coords = self._coords
         N = coords.shape[0]
-        rg_left = self._compute_gyration_radius(coords[:N // 2, :])
-        rg_right = self._compute_gyration_radius(coords[N - N // 2:, :])
+        halves = [coords[:N // 2, :], coords[N - N // 2:, :]]
+        if self.missing == 'skip':
+            halves = [half[~np.isnan(half).any(axis=1)] for half in halves]
+            if any(len(half) < 2 for half in halves):
+                return np.nan
+        rg_left, rg_right = (self._compute_gyration_radius(half) for half in halves)
         return float((rg_right - rg_left) / (rg_right + rg_left))
 
     @property
@@ -428,13 +540,16 @@ class RnaTrace(Trace):
 
         Returns:
             scipy.spatial.ConvexHull or None: ConvexHull object when coordinates
-                are complete; None if there are missing segments from the current `df`.
+                are complete ('nan' mode) or at least `min_spots` are placed
+                ('skip' mode, hull of the placed spots); None otherwise, or if
+                the spots are degenerate (e.g. collinear in 2D).
         """
-        if self._has_remaining_missing_segments:
+        coords = self._metric_coords
+        if coords is None:
             return None
         if self._convex_hull is None:
             try:
-                self._convex_hull = ConvexHull(self._coords)
+                self._convex_hull = ConvexHull(coords)
             except QhullError:
                 return None
         return self._convex_hull
@@ -529,11 +644,12 @@ class RnaTrace(Trace):
 
         Returns:
             float: Asphericity value, or ``numpy.nan`` if any coordinate in the
-                current trace is missing.
+                current trace is missing ('nan' mode) or fewer than `min_spots`
+                are placed ('skip' mode, computed over placed spots).
         """
-        if self._has_remaining_missing_segments:
+        c = self._metric_coords
+        if c is None:
             return np.nan
-        c = self._coords
         d = c.shape[1]                 # Auto-detects dimension (2 or 3)
 
         c = c - c.mean(axis=0)         # 1. Shift to center of mass
@@ -611,26 +727,44 @@ class RnaTrace(Trace):
                              f'but "{mode}" was provided.')
         return df
 
+    @property
+    def scaling_exponent(self) -> float:
+        """Slope of log10(distance) against log10(separation) over all pairs.
+
+        In 'skip' mode, only pairs whose two spots are placed are used, each at
+        its separation along the trace.
+
+        Returns:
+            float: The fitted slope, or ``numpy.nan`` if any distance is missing
+                ('nan' mode), or if fewer than `min_spots` spots are placed or
+                fewer than 2 separations remain ('skip' mode).
+        """
+        scaling_df = self.get_scaling_table(mode='all')
+        if self.missing == 'skip':
+            scaling_df = scaling_df.dropna(subset=['dist'])
+            if self.placed_count < self.min_spots or scaling_df['separation'].nunique() < 2:
+                return np.nan
+        return float(stats.linregress(np.log10(scaling_df['separation']),
+                                      np.log10(scaling_df['dist']))
+                          .slope)
+
     def get_all_metrics(self):
         """Compute and return all available metrics for the trace."""
-        scaling_df = self.get_scaling_table(mode='all')
-        scaling_coef = stats.linregress(np.log10(scaling_df['separation']),
-                                        np.log10(scaling_df['dist']))\
-                            .slope
-
         metrics = dict(Rg=self.gyration_radius,
                        asphericity=self.asphericity,
                        end_to_end_dist=self.end_to_end_distance,
                        contour_length=self.contour_length,
                        end_to_end_dist_norm=self.end_to_end_distance / self.contour_length,
                        half_ext_asym=self.half_extent_asymmetry,
-                       scaling_exp=scaling_coef,
+                       scaling_exp=self.scaling_exponent,
                        perimeter=self.perimeter,
                        area=self.area,
                        volume=self.volume)
 
-        dropouts_info = dict(missing_count=self.original_missing_count,
+        dropouts_info = dict(complete=self.is_complete,
+                             missing_count=self.original_missing_count,
                              present_count=self.original_present_count,
+                             placed_count=self.placed_count,
                              consecutive_missing=self.has_original_consecutive_missing_timepoints,
                              missing_left_edge=self.has_original_missing_left_edge,
                              missing_right_edge=self.has_original_missing_right_edge,
@@ -668,6 +802,7 @@ class SisterTrace:
         dim (str): Coordinate dimensionality, either '2d' or '3d'.
         impute (bool): If True, linearly impute interior missing coordinates
             within each subtrace.
+            Defaults to False (see `Trace`).
         metadata (dict | None): Optional metadata for the trace.
 
     Attributes:
@@ -689,7 +824,7 @@ class SisterTrace:
                  s2_left_timepoints: Sequence[int],
                  s2_right_timepoints: Sequence[int],
                  dim: Literal['2d', '3d'] = '2d',
-                 impute: bool = True,
+                 impute: bool = False,
                  metadata: dict | None = None,
                 ) -> None:
         self.metadata: dict | None = metadata
