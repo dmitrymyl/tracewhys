@@ -486,7 +486,9 @@ class RnaTrace(Trace):
         where Rg_left is computed over the first floor(N/2) points and
         Rg_right over the last ceil(N/2) points of the trace. The metric is
         signed: positive values indicate the right half is more extended,
-        negative values indicate the left half is more extended. Values are
+        negative values indicate the left half is more extended. "Left" is the
+        half with the earlier valid timepoints; whether that is the 5' or the
+        3' half depends on the probe design. Values are
         typically in the range (-1, 1) when radii are positive and finite.
 
         In 'skip' mode the halves are still split by position along the trace,
@@ -669,10 +671,10 @@ class RnaTrace(Trace):
 
         Args:
             mode: One of the following:
-                "anchor_5": Distances from the 5' end (index 0) to each
-                    downstream timepoint.
-                "anchor_3": Distances from the 3' end (last index) to each
-                    upstream timepoint.
+                "anchor_5": Distances from the first valid timepoint
+                    (index 0) to each later timepoint.
+                "anchor_3": Distances from the last valid timepoint
+                    (last index) to each earlier timepoint.
                 "all": All pairwise distances grouped by genomic/timepoint
                     separation.
                 "agg": One aggregated distance per separation, using
@@ -687,6 +689,12 @@ class RnaTrace(Trace):
                 the non-aggregated modes). ``n_missing`` is the number of those
                 pairs in which at least one segment was missing in the original
                 input (before imputation).
+
+        Note:
+            The mode names assume the first valid timepoint is the 5' end.
+            Which end it is depends on the probe design (the order in which
+            segments are imaged); when it is the 3' end, "anchor_5" anchors
+            at the 3' end and "anchor_3" at the 5' end.
         """
         mtx = self.distance_matrix
         n = mtx.shape[0]
