@@ -438,6 +438,10 @@ class RnaTrace(Trace):
             - `half_extent_asymmetry`: the placed spots of each half, with halves
               still defined by position along the trace; needs at least 2 placed
               spots per half;
+            - `gyration_radius_5`, `gyration_radius_3`, `centroid_distance_53`
+              and `fraction_5` (two-region decomposition of the squared radius
+              of gyration): the placed spots of the 5' and 3' groups; needs at
+              least 2 placed spots per group;
             - `end_to_end_distance` and `contour_length` stay `numpy.nan` when an
               end spot (respectively, any spot) is missing, since skipping a spot
               would shorten them.
@@ -472,6 +476,7 @@ class RnaTrace(Trace):
                          missing=missing, min_spots=min_spots)
         self.metadata: dict | None = metadata
         self._convex_hull: ConvexHull | None = None
+        self._two_region_cache: tuple[float, float, float, float] | None = None
 
     @property
     def half_extent_asymmetry(self) -> float:
@@ -511,6 +516,65 @@ class RnaTrace(Trace):
                 return np.nan
         rg_left, rg_right = (self._compute_gyration_radius(half) for half in halves)
         return float((rg_right - rg_left) / (rg_right + rg_left))
+
+    @property
+    def _two_region(self) -> tuple[float, float, float, float]:
+        """Two-region decomposition of the squared radius of gyration.
+
+        The spots are split into a 5' group (the first floor(N/2) timepoints)
+        and a 3' group (the remaining ceil(N/2), so for odd N the middle spot
+        belongs to the 3' group). With `u` the fraction of spots in the 5'
+        group, `R5` and `R3` the radii of gyration of the two groups and `D53`
+        the distance between their centroids, exactly:
+
+            Rg^2 = u R5^2 + (1 - u) R3^2 + u (1 - u) D53^2
+
+        In 'skip' mode each group uses its placed spots and `u` is computed
+        over the placed spots, so the identity holds for the 'skip'-mode
+        `gyration_radius`. As for the "anchor_5" mode of `get_scaling_table`,
+        the first valid timepoint is taken to be the 5' end.
+
+        Returns:
+            tuple[float, float, float, float]: `(R5, R3, D53, u)`, all
+                ``numpy.nan`` if any coordinate is missing ('nan' mode) or if
+                a group has fewer than 2 placed spots ('skip' mode).
+        """
+        if self._two_region_cache is None:
+            self._two_region_cache = (np.nan,) * 4
+            coords = self._coords
+            N = coords.shape[0]
+            groups = [coords[:N // 2, :], coords[N // 2:, :]]
+            if self.missing == 'skip':
+                groups = [group[~np.isnan(group).any(axis=1)] for group in groups]
+            if not any(self._has_missing_values(group) or len(group) < 2 for group in groups):
+                five, three = groups
+                self._two_region_cache = (
+                    self._compute_gyration_radius(five),
+                    self._compute_gyration_radius(three),
+                    float(np.linalg.norm(five.mean(axis=0) - three.mean(axis=0))),
+                    len(five) / (len(five) + len(three)),
+                )
+        return self._two_region_cache
+
+    @property
+    def gyration_radius_5(self) -> float:
+        """Radius of gyration of the 5' group of spots (see `_two_region`)."""
+        return self._two_region[0]
+
+    @property
+    def gyration_radius_3(self) -> float:
+        """Radius of gyration of the 3' group of spots (see `_two_region`)."""
+        return self._two_region[1]
+
+    @property
+    def centroid_distance_53(self) -> float:
+        """Distance between the centroids of the 5' and 3' groups (see `_two_region`)."""
+        return self._two_region[2]
+
+    @property
+    def fraction_5(self) -> float:
+        """Fraction of the spots used that belong to the 5' group (see `_two_region`)."""
+        return self._two_region[3]
 
     @property
     def end_to_end_distance(self) -> float:
@@ -764,6 +828,10 @@ class RnaTrace(Trace):
                        contour_length=self.contour_length,
                        end_to_end_dist_norm=self.end_to_end_distance / self.contour_length,
                        half_ext_asym=self.half_extent_asymmetry,
+                       Rg_5=self.gyration_radius_5,
+                       Rg_3=self.gyration_radius_3,
+                       D_53=self.centroid_distance_53,
+                       frac_5=self.fraction_5,
                        scaling_exp=self.scaling_exponent,
                        perimeter=self.perimeter,
                        area=self.area,
