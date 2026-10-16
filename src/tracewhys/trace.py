@@ -807,7 +807,6 @@ class RnaTrace(Trace):
                        Rg_3=self.two_halves.gyration_radius_3,
                        D_53=self.two_halves.centroid_distance,
                        frac_5=self.two_halves.fraction_5,
-                       scaling_exp=self.scaling_exponent,
                        perimeter=self.perimeter,
                        area=self.area,
                        volume=self.volume)
