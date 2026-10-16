@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -210,26 +211,67 @@ class RnaExpConfig:
         return table
 
 
-def write_metrics(metrics_df: pd.DataFrame, output_path: str) -> None:
+ARRAY_COLS: tuple[str, ...] = ('distance_matrix', 'timepoint_mask')
+
+
+def _to_nested_list(value):
+    """Convert a NumPy array of any dimensionality to nested lists for parquet."""
+    return value.tolist() if isinstance(value, np.ndarray) else value
+
+
+def _to_ndarray(value):
+    """Rebuild a NumPy array from a parquet list cell of any nesting depth.
+
+    pyarrow returns a list column cell as a 1-D array, of `object` dtype when
+    its elements are themselves lists; those elements are stacked recursively.
+    """
+    if value is None:
+        return None
+    arr = np.asarray(value)
+    if arr.dtype == object and arr.size > 0:
+        return np.stack([_to_ndarray(v) for v in arr])
+    return arr
+
+
+def write_metrics(metrics_df: pd.DataFrame,
+                  output_path: str,
+                  array_cols: Iterable[str] = ARRAY_COLS,
+                 ) -> None:
     """Write the metrics dataframe to a parquet file.
 
     Args:
         metrics_df: DataFrame containing computed metrics for traces.
         output_path: Path to the output parquet file.
+        array_cols: Columns holding NumPy arrays (of any dimensionality),
+            stored as nested lists. Columns absent from `metrics_df` are
+            skipped. Pass the same columns to `read_metrics`.
+
+    Note:
+        All arrays in one column must have the same number of dimensions,
+        since parquet stores a column with a single nesting depth; mixing,
+        e.g., 1-D and 2-D arrays raises ``pyarrow.ArrowInvalid``. Their
+        shapes may differ between rows (e.g. distance matrices of traces with
+        different numbers of timepoints), and cells may be ``None``.
     """
-    metrics_df.assign(distance_matrix=lambda df: df['distance_matrix'].map(lambda x: x.tolist()))\
+    present = [col for col in array_cols if col in metrics_df.columns]
+    metrics_df.assign(**{col: metrics_df[col].map(_to_nested_list) for col in present})\
               .to_parquet(output_path, engine='pyarrow', index=False)
 
 
-def read_metrics(input_path: str) -> pd.DataFrame:
+def read_metrics(input_path: str,
+                 array_cols: Iterable[str] = ARRAY_COLS,
+                ) -> pd.DataFrame:
     """Read the trace metrics dataframe from a parquet file.
 
     Args:
         input_path: Path to the input parquet file.
+        array_cols: Columns to convert back to NumPy arrays, as written by
+            `write_metrics` (each with arrays of one dimensionality, see
+            there). Columns absent from the file are skipped.
+
     Returns:
         DataFrame containing the metrics.
     """
-    metrics_df = pd.read_parquet(input_path)\
-                   .assign(distance_matrix=lambda df: df['distance_matrix'].map(np.stack),
-                           timepoint_mask=lambda df: df['timepoint_mask'].map(np.asarray))
-    return metrics_df
+    metrics_df = pd.read_parquet(input_path)
+    present = [col for col in array_cols if col in metrics_df.columns]
+    return metrics_df.assign(**{col: metrics_df[col].map(_to_ndarray) for col in present})

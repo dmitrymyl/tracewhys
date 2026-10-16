@@ -481,8 +481,6 @@ class RnaTrace(Trace):
               interior gaps are bridged by straight lines and missing end spots
               truncate it;
             - `end_to_end_distance` is `numpy.nan` when an end spot is missing.
-        - To restrict an analysis to full traces, select the rows of
-          `get_all_metrics()` whose `complete` column is True (see `is_complete`).
     """
     def __init__(self,
                  df: pd.DataFrame,
