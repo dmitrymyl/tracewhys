@@ -1,4 +1,5 @@
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
@@ -392,6 +393,43 @@ class Trace:
         return self._distance_matrix
 
 
+@dataclass(frozen=True, slots=True)
+class TwoHalves:
+    """Two-halves decomposition of the squared radius of gyration of a trace.
+
+    The spots are split into a 5' half (the first floor(N/2) timepoints) and
+    a 3' half (the last floor(N/2) timepoints), so for odd N the middle spot
+    belongs to neither. With `u` the fraction of spots in the 5' half, `R5`
+    and `R3` the radii of gyration of the two halves and `D` the distance
+    between their centroids, exactly:
+
+        Rg^2 = u R5^2 + (1 - u) R3^2 + u (1 - u) D^2
+
+    where `Rg` is the radius of gyration of the spots of both halves. Each half
+    uses its placed spots and `u` is computed over the placed spots, so for
+    even N `Rg` is the trace's `gyration_radius`; for odd N it leaves out the
+    middle spot. As for the "anchor_5" mode of `RnaTrace.get_scaling_table`,
+    the first valid timepoint is taken to be the 5' end.
+
+    Attributes:
+        gyration_radius_5 (float): Radius of gyration of the 5' half, `R5`.
+        gyration_radius_3 (float): Radius of gyration of the 3' half, `R3`.
+        centroid_distance (float): Distance between the centroids of the two
+            halves, `D`.
+        fraction_5 (float): Fraction of the spots used that belong to the 5'
+            half, `u`.
+    """
+    gyration_radius_5: float
+    gyration_radius_3: float
+    centroid_distance: float
+    fraction_5: float
+
+    @classmethod
+    def nan(cls) -> 'TwoHalves':
+        """Decomposition with all fields `numpy.nan`, for when a half has no placed spot."""
+        return cls(np.nan, np.nan, np.nan, np.nan)
+
+
 class RnaTrace(Trace):
     """Handles coordinate measurements for a single RNA trace and computes shape metrics.
 
@@ -422,13 +460,12 @@ class RnaTrace(Trace):
             - `scaling_exponent`: the pairs of placed spots, at their separation
               along the trace (not their rank among the placed spots); needs at
               least 2 distinct separations;
-            - `half_extent_asymmetry`: the placed spots of each half, with halves
-              still defined by position along the trace; needs at least 1 placed
-              spot per half and a nonzero radius in one of them;
-            - `gyration_radius_5`, `gyration_radius_3`, `centroid_distance_53`
-              and `fraction_5` (two-region decomposition of the squared radius
-              of gyration): the placed spots of the 5' and 3' groups; needs at
-              least 1 placed spot per group;
+            - `two_halves` (two-halves decomposition of the squared radius of
+              gyration, see `TwoHalves`): the placed spots of the 5' and 3'
+              halves, with halves still defined by position along the trace;
+              needs at least 1 placed spot per half;
+            - `half_extent_asymmetry`: built from the radii of gyration of
+              `two_halves`; also needs a nonzero radius in one of them;
             - `contour_length`: the placed spots joined in timepoint order, so
               interior gaps are bridged by straight lines and missing end spots
               truncate it;
@@ -459,97 +496,62 @@ class RnaTrace(Trace):
         super().__init__(df, valid_timepoints, dim=dim, impute=impute)
         self.metadata: dict | None = metadata
         self._convex_hull: ConvexHull | None = None
-        self._two_region_cache: tuple[float, float, float, float] | None = None
+        self._two_halves: TwoHalves | None = None
+
+    @property
+    def two_halves(self) -> TwoHalves:
+        """Two-halves decomposition of the squared radius of gyration.
+
+        See `TwoHalves` for how the trace is split and what the fields mean.
+
+        Returns:
+            TwoHalves: The decomposition, with all fields ``numpy.nan`` if a
+                half has no placed spot.
+        """
+        if self._two_halves is None:
+            self._two_halves = TwoHalves.nan()
+            coords = self._coords
+            placed = self.placed_timepoint_mask
+            N = coords.shape[0]
+            halves = [coords[:N // 2][placed[:N // 2]], coords[N - N // 2:][placed[N - N // 2:]]]
+            if all(len(half) > 0 for half in halves):
+                five, three = halves
+                self._two_halves = TwoHalves(
+                    gyration_radius_5=self._compute_gyration_radius(five, nan_policy='omit'),
+                    gyration_radius_3=self._compute_gyration_radius(three, nan_policy='omit'),
+                    centroid_distance=float(np.linalg.norm(five.mean(axis=0) - three.mean(axis=0))),
+                    fraction_5=len(five) / (len(five) + len(three)),
+                )
+        return self._two_halves
 
     @property
     def half_extent_asymmetry(self) -> float:
         """Half-extent asymmetry comparing left and right halves of a trace.
 
         The metric compares the spatial extent of the left and right halves
-        by computing the radius of gyration for each half and returning the
-        normalized difference:
+        by their radii of gyration, returning the normalized difference:
 
             (Rg_right - Rg_left) / (Rg_right + Rg_left)
 
-        where Rg_left is computed over the first floor(N/2) points and
-        Rg_right over the last ceil(N/2) points of the trace. The metric is
-        signed: positive values indicate the right half is more extended,
-        negative values indicate the left half is more extended. "Left" is the
-        half with the earlier valid timepoints; whether that is the 5' or the
-        3' half depends on the probe design. Values are
+        where Rg_left and Rg_right are `two_halves.gyration_radius_5` (the
+        first floor(N/2) points) and `two_halves.gyration_radius_3` (the last
+        floor(N/2) points), so for odd N the middle point is left out. The
+        metric is signed: positive values indicate the right half is more
+        extended, negative values indicate the left half is more extended.
+        "Left" is the half with the earlier valid timepoints; whether that is
+        the 5' or the 3' half depends on the probe design. Values are
         typically in the range (-1, 1) when radii are positive and finite.
 
-        The halves are split by position along the trace, and each Rg is
-        computed over the placed spots of its half.
+        Each Rg is computed over the placed spots of its half.
 
         Returns:
             float: The half-extent asymmetry, or ``numpy.nan`` if a half has no
                 placed spot or both radii are zero.
         """
-        coords = self._coords
-        N = coords.shape[0]
-        halves = [coords[:N // 2, :], coords[N - N // 2:, :]]
-        rg_left, rg_right = (self._compute_gyration_radius(half, nan_policy='omit') for half in halves)
+        rg_left, rg_right = self.two_halves.gyration_radius_5, self.two_halves.gyration_radius_3
         if rg_right + rg_left == 0:
             return np.nan
         return float((rg_right - rg_left) / (rg_right + rg_left))
-
-    @property
-    def _two_region(self) -> tuple[float, float, float, float]:
-        """Two-region decomposition of the squared radius of gyration.
-
-        The spots are split into a 5' group (the first floor(N/2) timepoints)
-        and a 3' group (the remaining ceil(N/2), so for odd N the middle spot
-        belongs to the 3' group). With `u` the fraction of spots in the 5'
-        group, `R5` and `R3` the radii of gyration of the two groups and `D53`
-        the distance between their centroids, exactly:
-
-            Rg^2 = u R5^2 + (1 - u) R3^2 + u (1 - u) D53^2
-
-        Each group uses its placed spots and `u` is computed over the placed
-        spots, so the identity holds for `gyration_radius`. As for the
-        "anchor_5" mode of `get_scaling_table`, the first valid timepoint is
-        taken to be the 5' end.
-
-        Returns:
-            tuple[float, float, float, float]: `(R5, R3, D53, u)`, all
-                ``numpy.nan`` if a group has no placed spot.
-        """
-        if self._two_region_cache is None:
-            self._two_region_cache = (np.nan,) * 4
-            coords = self._coords
-            placed = self.placed_timepoint_mask
-            N = coords.shape[0]
-            groups = [coords[:N // 2][placed[:N // 2]], coords[N // 2:][placed[N // 2:]]]
-            if all(len(group) > 0 for group in groups):
-                five, three = groups
-                self._two_region_cache = (
-                    self._compute_gyration_radius(five, nan_policy='omit'),
-                    self._compute_gyration_radius(three, nan_policy='omit'),
-                    float(np.linalg.norm(five.mean(axis=0) - three.mean(axis=0))),
-                    len(five) / (len(five) + len(three)),
-                )
-        return self._two_region_cache
-
-    @property
-    def gyration_radius_5(self) -> float:
-        """Radius of gyration of the 5' group of spots (see `_two_region`)."""
-        return self._two_region[0]
-
-    @property
-    def gyration_radius_3(self) -> float:
-        """Radius of gyration of the 3' group of spots (see `_two_region`)."""
-        return self._two_region[1]
-
-    @property
-    def centroid_distance_53(self) -> float:
-        """Distance between the centroids of the 5' and 3' groups (see `_two_region`)."""
-        return self._two_region[2]
-
-    @property
-    def fraction_5(self) -> float:
-        """Fraction of the spots used that belong to the 5' group (see `_two_region`)."""
-        return self._two_region[3]
 
     @property
     def end_to_end_distance(self) -> float:
@@ -800,10 +802,10 @@ class RnaTrace(Trace):
                        end_to_end_dist=self.end_to_end_distance,
                        contour_length=self.contour_length,
                        half_ext_asym=self.half_extent_asymmetry,
-                       Rg_5=self.gyration_radius_5,
-                       Rg_3=self.gyration_radius_3,
-                       D_53=self.centroid_distance_53,
-                       frac_5=self.fraction_5,
+                       Rg_5=self.two_halves.gyration_radius_5,
+                       Rg_3=self.two_halves.gyration_radius_3,
+                       D_53=self.two_halves.centroid_distance,
+                       frac_5=self.two_halves.fraction_5,
                        scaling_exp=self.scaling_exponent,
                        perimeter=self.perimeter,
                        area=self.area,
