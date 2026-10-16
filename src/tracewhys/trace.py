@@ -48,28 +48,20 @@ class Trace:
             Defaults to False: an imputed spot lies on the straight line between
             its neighbours, which shortens its distances to them and biases
             distance-based metrics.
-        missing (str): How metrics treat coordinates that are still missing
-            after imputation (if any). 'nan' (default): a metric that uses a
-            missing spot is `numpy.nan`. 'skip': missing spots are left out and
-            metrics are computed from the remaining spots (see `RnaTrace`).
-        min_spots (int): In 'skip' mode, the minimum number of spots with a
-            position (detected, or imputed when `impute=True`) needed for
-            metrics computed over the spot cloud; below it they are `numpy.nan`.
 
     Attributes:
         original_timepoint_mask (np.ndarray): Boolean mask per timepoint indicating
             whether a coordinate was present in the original pre-imputation input.
         df (pd.DataFrame): Working dataframe (imputed if `impute=True`).
         dim (str): Coordinate dimensionality ('2d' or '3d').
-        missing (str): Missing-spot mode, 'nan' or 'skip'.
-        min_spots (int): Minimum number of spots for 'skip'-mode metrics.
 
     Notes:
         - Properties prefixed with `original_` refer to the pre-imputation state.
-        - Metric properties return `numpy.nan` when required coordinates are missing
-          (`missing='nan'`), or when too few spots remain (`missing='skip'`).
-        - In 'skip' mode, a trace missing an end spot covers a shorter stretch of
-          the molecule, so size-type metrics (radius of gyration, convex hull) are
+        - Metrics are computed from the placed spots (detected, or imputed when
+          `impute=True`); spots still missing are left out. A metric is
+          `numpy.nan` only when too few spots remain for it to be defined.
+        - A trace missing an end spot covers a shorter stretch of the molecule,
+          so size-type metrics (radius of gyration, convex hull) are
           systematically smaller than for a complete trace. Pooling partial and
           complete traces mixes these populations.
         - Private helpers and cached attributes are named with a leading underscore and
@@ -80,8 +72,6 @@ class Trace:
                  valid_timepoints: Sequence[int],
                  dim: Literal['2d', '3d'] = '2d',
                  impute: bool = False,
-                 missing: Literal['nan', 'skip'] = 'nan',
-                 min_spots: int = 3,
                 ) -> None:
         """Create a trace run from coordinate measurements.
 
@@ -90,23 +80,14 @@ class Trace:
             valid_timepoints: Expected ordered timepoints for the trace.
             dim: Coordinate dimensionality, either ``"2d"`` or ``"3d"``.
             impute: Whether to linearly impute missing interior coordinates.
-            missing: Missing-spot mode, either ``"nan"`` or ``"skip"``.
-            min_spots: Minimum number of spots for ``"skip"``-mode metrics.
 
         Raises:
-            ValueError: If ``dim`` or ``missing`` is invalid, ``min_spots`` is
-                below 2, or required columns/timepoints are missing or unexpected.
+            ValueError: If ``dim`` is invalid or required columns/timepoints are
+                missing or unexpected.
         """
-        if missing not in ('nan', 'skip'):
-            raise ValueError(f'`missing` must be "nan" or "skip", but "{missing}" was provided.')
-        if min_spots < 2:
-            raise ValueError(f'`min_spots` must be at least 2, but {min_spots} was provided.')
-
         self._valid_timepoints: Sequence[int] = valid_timepoints
         self._coord_cols: list[str] = _coord_cols_for_dim(dim)
         self.dim: Literal['2d', '3d'] = dim
-        self.missing: Literal['nan', 'skip'] = missing
-        self.min_spots: int = min_spots
 
         self._validate_structure(df)
         self._original_df: pd.DataFrame = self._reindex_to_valid_timepoints(df)
@@ -194,9 +175,9 @@ class Trace:
     def is_complete(self) -> bool:
         """Whether every timepoint was present in the original input.
 
-        For a complete trace, metrics do not depend on `impute` or `missing`,
-        so selecting complete traces after computing metrics in any mode gives
-        the full-trace-only analysis.
+        For a complete trace, metrics do not depend on `impute`, so selecting
+        complete traces after computing metrics gives the full-trace-only
+        analysis.
 
         Returns:
             bool: True if no timepoint was missing before imputation.
@@ -332,21 +313,13 @@ class Trace:
         return int(self.placed_timepoint_mask.sum())
 
     @property
-    def _metric_coords(self) -> NDArray[np.float64] | None:
-        """Coordinates used by metrics computed over the whole spot cloud.
+    def _placed_coords(self) -> NDArray[np.float64]:
+        """Coordinates of the placed spots, in timepoint order.
 
         Returns:
-            np.ndarray or None: In 'nan' mode, all coordinates, or None if any is
-                missing. In 'skip' mode, the coordinates of the placed spots, or
-                None if there are fewer than `min_spots` of them.
+            np.ndarray: Array of shape (placed_count, n_dimensions).
         """
-        if self.missing == 'skip':
-            if self.placed_count < self.min_spots:
-                return None
-            return self._coords[self.placed_timepoint_mask]
-        if self._has_remaining_missing_segments:
-            return None
-        return self._coords
+        return self._coords[self.placed_timepoint_mask]
 
     @staticmethod
     def _has_missing_values(arr: ArrayLike) -> bool:
@@ -361,17 +334,33 @@ class Trace:
         return bool(np.isnan(arr).any())
 
     @classmethod
-    def _compute_gyration_radius(cls, coords: NDArray[np.float64]) -> float:
+    def _compute_gyration_radius(cls,
+                                 coords: NDArray[np.float64],
+                                 nan_policy: Literal['propagate', 'omit'] = 'propagate',
+                                ) -> float:
         """Compute the radius of gyration for a set of coordinates.
 
         Args:
             coords (np.ndarray): Array of shape (n, d) where n is the number of
                 points and d is dimensionality (2 or 3).
+            nan_policy: How to handle points with NaN coordinates, in the style
+                of scipy. ``"propagate"``: return `numpy.nan` if any point has a
+                NaN. ``"omit"``: leave such points out of the calculation.
 
         Returns:
-            float: Radius of gyration, or `numpy.nan` if `coords` contains NaNs.
+            float: Radius of gyration, or `numpy.nan` if no points remain (or,
+                with ``"propagate"``, if `coords` contains NaNs).
+
+        Raises:
+            ValueError: If ``nan_policy`` is invalid.
         """
+        if nan_policy not in ('propagate', 'omit'):
+            raise ValueError(f'`nan_policy` must be "propagate" or "omit", but "{nan_policy}" was provided.')
         if cls._has_missing_values(coords):
+            if nan_policy == 'propagate':
+                return np.nan
+            coords = coords[~np.isnan(coords).any(axis=1)]
+        if len(coords) == 0:
             return np.nan
         center_of_mass = np.mean(coords, axis=0)
         shifted_coords = coords - center_of_mass
@@ -380,16 +369,13 @@ class Trace:
 
     @property
     def gyration_radius(self) -> float:
-        """Radius of gyration of the trace coordinates.
+        """Radius of gyration of the placed spots.
 
         Returns:
-            float: Computed radius of gyration, or `numpy.nan` if any timepoints
-                are missing from the current `df` ('nan' mode) or fewer than
-                `min_spots` are placed ('skip' mode, computed over placed spots).
+            float: Computed radius of gyration, or `numpy.nan` if no spot is placed.
         """
         if self._gyration_radius is None:
-            coords = self._metric_coords
-            self._gyration_radius = np.nan if coords is None else self._compute_gyration_radius(coords)
+            self._gyration_radius = self._compute_gyration_radius(self._coords, nan_policy='omit')
         return float(self._gyration_radius)
 
     @property
@@ -416,8 +402,6 @@ class RnaTrace(Trace):
         dim (str): Coordinate dimensionality, either '2d' or '3d'.
         impute (bool): If True, linearly impute interior missing coordinates.
             Defaults to False (see `Trace`).
-        missing (str): Missing-spot mode, 'nan' (default) or 'skip' (see `Trace`).
-        min_spots (int): Minimum number of spots for 'skip'-mode metrics.
         metadata (TraceMetadata | None): Optional metadata for the trace.
 
     Attributes:
@@ -428,23 +412,27 @@ class RnaTrace(Trace):
           `original_timepoint_mask`, dropout indicators (`original_missing_count`,
           `has_original_missing_left_edge`, ...), `gyration_radius`,
           `distance_matrix`, etc.
-        - Metric properties return `numpy.nan` when required coordinates are missing.
-        - With `missing='skip'`, each metric uses the spots it can:
-            - `gyration_radius`, `asphericity` and the convex hull: the placed
-              spots, if there are at least `min_spots` (the hull also needs 3
-              non-collinear spots in 2D, 4 non-coplanar in 3D);
+        - Each metric uses the placed spots it can, and is `numpy.nan` only when
+          it is not defined for them:
+            - `gyration_radius`: the placed spots; needs at least 1;
+            - `asphericity`: the placed spots; needs at least 2 not all at the
+              same position;
+            - convex hull metrics: the placed spots; needs 3 non-collinear
+              spots in 2D, 4 non-coplanar in 3D;
             - `scaling_exponent`: the pairs of placed spots, at their separation
-              along the trace (not their rank among the placed spots);
+              along the trace (not their rank among the placed spots); needs at
+              least 2 distinct separations;
             - `half_extent_asymmetry`: the placed spots of each half, with halves
-              still defined by position along the trace; needs at least 2 placed
-              spots per half;
+              still defined by position along the trace; needs at least 1 placed
+              spot per half and a nonzero radius in one of them;
             - `gyration_radius_5`, `gyration_radius_3`, `centroid_distance_53`
               and `fraction_5` (two-region decomposition of the squared radius
               of gyration): the placed spots of the 5' and 3' groups; needs at
-              least 2 placed spots per group;
-            - `end_to_end_distance` and `contour_length` stay `numpy.nan` when an
-              end spot (respectively, any spot) is missing, since skipping a spot
-              would shorten them.
+              least 1 placed spot per group;
+            - `contour_length`: the placed spots joined in timepoint order, so
+              interior gaps are bridged by straight lines and missing end spots
+              truncate it;
+            - `end_to_end_distance` is `numpy.nan` when an end spot is missing.
         - To restrict an analysis to full traces, select the rows of
           `get_all_metrics()` whose `complete` column is True (see `is_complete`).
     """
@@ -454,8 +442,6 @@ class RnaTrace(Trace):
                  dim: Literal['2d', '3d'] = '2d',
                  impute: bool = False,
                  metadata: dict | None = None,
-                 missing: Literal['nan', 'skip'] = 'nan',
-                 min_spots: int = 3,
                 ) -> None:
         """Create an RNA trace from coordinate measurements.
 
@@ -465,15 +451,12 @@ class RnaTrace(Trace):
             dim: Coordinate dimensionality, either ``"2d"`` or ``"3d"``.
             impute: Whether to linearly impute missing interior coordinates.
             metadata: Optional trace metadata.
-            missing: Missing-spot mode, either ``"nan"`` or ``"skip"``.
-            min_spots: Minimum number of spots for ``"skip"``-mode metrics.
 
         Raises:
-            ValueError: If ``dim`` or ``missing`` is invalid, ``min_spots`` is
-                below 2, or required columns/timepoints are missing or unexpected.
+            ValueError: If ``dim`` is invalid or required columns/timepoints are
+                missing or unexpected.
         """
-        super().__init__(df, valid_timepoints, dim=dim, impute=impute,
-                         missing=missing, min_spots=min_spots)
+        super().__init__(df, valid_timepoints, dim=dim, impute=impute)
         self.metadata: dict | None = metadata
         self._convex_hull: ConvexHull | None = None
         self._two_region_cache: tuple[float, float, float, float] | None = None
@@ -496,25 +479,19 @@ class RnaTrace(Trace):
         3' half depends on the probe design. Values are
         typically in the range (-1, 1) when radii are positive and finite.
 
-        In 'skip' mode the halves are still split by position along the trace,
-        and each Rg is computed over the placed spots of its half.
+        The halves are split by position along the trace, and each Rg is
+        computed over the placed spots of its half.
 
         Returns:
-            float: The half-extent asymmetry, or ``numpy.nan`` if the metric
-                cannot be computed because of missing coordinates ('nan' mode)
-                or because a half has fewer than 2 placed spots ('skip' mode).
-                If both radii are zero the result is undefined.
+            float: The half-extent asymmetry, or ``numpy.nan`` if a half has no
+                placed spot or both radii are zero.
         """
-        if self.missing == 'nan' and self._has_remaining_missing_segments:
-            return np.nan
         coords = self._coords
         N = coords.shape[0]
         halves = [coords[:N // 2, :], coords[N - N // 2:, :]]
-        if self.missing == 'skip':
-            halves = [half[~np.isnan(half).any(axis=1)] for half in halves]
-            if any(len(half) < 2 for half in halves):
-                return np.nan
-        rg_left, rg_right = (self._compute_gyration_radius(half) for half in halves)
+        rg_left, rg_right = (self._compute_gyration_radius(half, nan_policy='omit') for half in halves)
+        if rg_right + rg_left == 0:
+            return np.nan
         return float((rg_right - rg_left) / (rg_right + rg_left))
 
     @property
@@ -529,28 +506,26 @@ class RnaTrace(Trace):
 
             Rg^2 = u R5^2 + (1 - u) R3^2 + u (1 - u) D53^2
 
-        In 'skip' mode each group uses its placed spots and `u` is computed
-        over the placed spots, so the identity holds for the 'skip'-mode
-        `gyration_radius`. As for the "anchor_5" mode of `get_scaling_table`,
-        the first valid timepoint is taken to be the 5' end.
+        Each group uses its placed spots and `u` is computed over the placed
+        spots, so the identity holds for `gyration_radius`. As for the
+        "anchor_5" mode of `get_scaling_table`, the first valid timepoint is
+        taken to be the 5' end.
 
         Returns:
             tuple[float, float, float, float]: `(R5, R3, D53, u)`, all
-                ``numpy.nan`` if any coordinate is missing ('nan' mode) or if
-                a group has fewer than 2 placed spots ('skip' mode).
+                ``numpy.nan`` if a group has no placed spot.
         """
         if self._two_region_cache is None:
             self._two_region_cache = (np.nan,) * 4
             coords = self._coords
+            placed = self.placed_timepoint_mask
             N = coords.shape[0]
-            groups = [coords[:N // 2, :], coords[N // 2:, :]]
-            if self.missing == 'skip':
-                groups = [group[~np.isnan(group).any(axis=1)] for group in groups]
-            if not any(self._has_missing_values(group) or len(group) < 2 for group in groups):
+            groups = [coords[:N // 2][placed[:N // 2]], coords[N // 2:][placed[N // 2:]]]
+            if all(len(group) > 0 for group in groups):
                 five, three = groups
                 self._two_region_cache = (
-                    self._compute_gyration_radius(five),
-                    self._compute_gyration_radius(three),
+                    self._compute_gyration_radius(five, nan_policy='omit'),
+                    self._compute_gyration_radius(three, nan_policy='omit'),
                     float(np.linalg.norm(five.mean(axis=0) - three.mean(axis=0))),
                     len(five) / (len(five) + len(three)),
                 )
@@ -592,31 +567,31 @@ class RnaTrace(Trace):
     def contour_length(self) -> float:
         """Total contour length computed as the sum of consecutive segment lengths.
 
+        Missing spots are skipped: the placed spots are joined in timepoint
+        order, so an interior gap is bridged by a straight line (the same length
+        as with `impute=True`) and missing end spots truncate the contour.
+
         Returns:
-            float: Sum of distances between successive timepoints, or `numpy.nan`
-                if any timepoint is missing from the current `df`.
+            float: Sum of distances between successive placed spots, or
+                `numpy.nan` if no spot is placed.
         """
-        if self._has_remaining_missing_segments:
+        coords = self._placed_coords
+        if len(coords) == 0:
             return np.nan
-        return float(np.sum(np.diag(self.distance_matrix, k=1)))
+        return float(np.linalg.norm(np.diff(coords, axis=0), axis=1).sum())
 
     @property
     def convex_hull(self) -> ConvexHull | None:
-        """Convex hull of the coordinate set (2D case).
+        """Convex hull of the placed spots.
 
         Returns:
-            scipy.spatial.ConvexHull or None: ConvexHull object when coordinates
-                are complete ('nan' mode) or at least `min_spots` are placed
-                ('skip' mode, hull of the placed spots); None otherwise, or if
-                the spots are degenerate (e.g. collinear in 2D).
+            scipy.spatial.ConvexHull or None: ConvexHull object, or None if the
+                placed spots are too few or degenerate (e.g. collinear in 2D).
         """
-        coords = self._metric_coords
-        if coords is None:
-            return None
         if self._convex_hull is None:
             try:
-                self._convex_hull = ConvexHull(coords)
-            except QhullError:
+                self._convex_hull = ConvexHull(self._placed_coords)
+            except (QhullError, ValueError):  # ValueError when no spot is placed
                 return None
         return self._convex_hull
 
@@ -709,12 +684,11 @@ class RnaTrace(Trace):
         Larger values indicate a more anisotropic distribution of mass.
 
         Returns:
-            float: Asphericity value, or ``numpy.nan`` if any coordinate in the
-                current trace is missing ('nan' mode) or fewer than `min_spots`
-                are placed ('skip' mode, computed over placed spots).
+            float: Asphericity value over the placed spots, or ``numpy.nan`` if
+                fewer than 2 are placed or all lie at the same position.
         """
-        c = self._metric_coords
-        if c is None:
+        c = self._placed_coords
+        if len(c) < 2:
             return np.nan
         d = c.shape[1]                 # Auto-detects dimension (2 or 3)
 
@@ -723,6 +697,8 @@ class RnaTrace(Trace):
 
         tr_S = np.trace(S)             # Trace of S
         tr_S2 = np.trace(S @ S)        # Trace of S squared matrix
+        if tr_S == 0:
+            return np.nan
 
         # 3. Generalized asphericity formula
         return float((d * tr_S2 - tr_S**2) / ((d - 1) * tr_S**2))
@@ -803,19 +779,16 @@ class RnaTrace(Trace):
     def scaling_exponent(self) -> float:
         """Slope of log10(distance) against log10(separation) over all pairs.
 
-        In 'skip' mode, only pairs whose two spots are placed are used, each at
-        its separation along the trace.
+        Only pairs whose two spots are placed are used, each at its separation
+        along the trace.
 
         Returns:
-            float: The fitted slope, or ``numpy.nan`` if any distance is missing
-                ('nan' mode), or if fewer than `min_spots` spots are placed or
-                fewer than 2 separations remain ('skip' mode).
+            float: The fitted slope, or ``numpy.nan`` if fewer than 2 distinct
+                separations remain.
         """
-        scaling_df = self.get_scaling_table(mode='all')
-        if self.missing == 'skip':
-            scaling_df = scaling_df.dropna(subset=['dist'])
-            if self.placed_count < self.min_spots or scaling_df['separation'].nunique() < 2:
-                return np.nan
+        scaling_df = self.get_scaling_table(mode='all').dropna(subset=['dist'])
+        if scaling_df['separation'].nunique() < 2:
+            return np.nan
         return float(stats.linregress(np.log10(scaling_df['separation']),
                                       np.log10(scaling_df['dist']))
                           .slope)
@@ -826,7 +799,6 @@ class RnaTrace(Trace):
                        asphericity=self.asphericity,
                        end_to_end_dist=self.end_to_end_distance,
                        contour_length=self.contour_length,
-                       end_to_end_dist_norm=self.end_to_end_distance / self.contour_length,
                        half_ext_asym=self.half_extent_asymmetry,
                        Rg_5=self.gyration_radius_5,
                        Rg_3=self.gyration_radius_3,
@@ -1124,14 +1096,14 @@ class SisterTrace:
             side: One of "both", "left", "right".
 
         Returns:
-            float: Radius of gyration, or `numpy.nan` if any selected
-                coordinate is missing.
+            float: Radius of gyration over the placed spots of the subset, or
+                `numpy.nan` if none is placed.
         """
         self._validate_sister_side(sister, side)
         if sister != 'both' and side != 'both':
             return self._subtraces[(sister, side)].gyration_radius
         subset_df = self._subset_df(sister, side)
-        return Trace._compute_gyration_radius(subset_df[self._coord_cols].to_numpy())
+        return Trace._compute_gyration_radius(subset_df[self._coord_cols].to_numpy(), nan_policy='omit')
 
     @property
     def distance_matrix(self) -> NDArray[np.float64]:
