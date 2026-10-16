@@ -43,7 +43,8 @@ class Trace:
         df (pd.DataFrame): Input coordinate measurements with a `timepoint`
             column and coordinate columns (`x`, `y`, [`z`] for 3D). May
             contain missing values.
-        valid_timepoints (Sequence): Ordered list/array of expected timepoints.
+        valid_timepoints (Sequence): Expected timepoints, ordered along the
+            molecule from its 5' end to its 3' end (see Notes).
         dim (str): Coordinate dimensionality, either '2d' or '3d'.
         impute (bool): If True, linearly impute interior missing coordinates.
             Defaults to False: an imputed spot lies on the straight line between
@@ -57,6 +58,13 @@ class Trace:
         dim (str): Coordinate dimensionality ('2d' or '3d').
 
     Notes:
+        - The order of `valid_timepoints` defines the trace's orientation: the
+          first timepoint is the 5' end and the last is the 3' end. For DNA this
+          is the direction along the genome; for RNA it is the direction of the
+          transcript itself, not of its genomic annotation. This order may
+          differ from the imaging order of the segments, so pass the timepoints
+          in molecule order. Everything order-dependent follows it: first and
+          last spots, 5' and 3' halves, contour length and separations.
         - Properties prefixed with `original_` refer to the pre-imputation state.
         - Metrics are computed from the available spots (detected, or imputed when
           `impute=True`); spots still missing are left out. A metric is
@@ -78,7 +86,8 @@ class Trace:
 
         Args:
             df: DataFrame containing timepoint-indexed coordinate measurements.
-            valid_timepoints: Expected ordered timepoints for the trace.
+            valid_timepoints: Expected timepoints, ordered 5' to 3' along the
+                molecule.
             dim: Coordinate dimensionality, either ``"2d"`` or ``"3d"``.
             impute: Whether to linearly impute missing interior coordinates.
 
@@ -408,8 +417,7 @@ class TwoHalves:
     where `Rg` is the radius of gyration of the spots of both halves. Each half
     uses its available spots and `u` is computed over the available spots, so for
     even N `Rg` is the trace's `gyration_radius`; for odd N it leaves out the
-    middle spot. As for the "anchor_5" mode of `RnaTrace.get_scaling_table`,
-    the first valid timepoint is taken to be the 5' end.
+    middle spot. 5' and 3' follow the order of `valid_timepoints` (see `Trace`).
 
     Attributes:
         gyration_radius_5 (float): Radius of gyration of the 5' half, `R5`.
@@ -436,7 +444,8 @@ class RnaTrace(Trace):
     Args:
         df (pd.DataFrame): Input coordinate measurements with a `timepoint` column
             and coordinate columns (`x`, `y`, [`z`] for 3D). May contain missing values.
-        valid_timepoints (Sequence): Ordered list/array of expected timepoints.
+        valid_timepoints (Sequence): Expected timepoints, ordered from the 5'
+            end to the 3' end of the transcript (see `Trace`).
         dim (str): Coordinate dimensionality, either '2d' or '3d'.
         impute (bool): If True, linearly impute interior missing coordinates.
             Defaults to False (see `Trace`).
@@ -446,6 +455,8 @@ class RnaTrace(Trace):
         metadata (dict | None): Trace metadata if provided.
 
     Notes:
+        - 5' and 3' refer to the ends of the transcript itself, as set by the
+          order of `valid_timepoints` (see `Trace`).
         - See `Trace` for the shared single-run behavior: imputation,
           `original_timepoint_mask`, dropout indicators (`original_missing_count`,
           `has_original_missing_left_edge`, ...), `gyration_radius`,
@@ -484,7 +495,8 @@ class RnaTrace(Trace):
 
         Args:
             df: DataFrame containing timepoint-indexed coordinate measurements.
-            valid_timepoints: Expected ordered timepoints for the trace.
+            valid_timepoints: Expected timepoints, ordered 5' to 3' along the
+                transcript.
             dim: Coordinate dimensionality, either ``"2d"`` or ``"3d"``.
             impute: Whether to linearly impute missing interior coordinates.
             metadata: Optional trace metadata.
@@ -527,21 +539,20 @@ class RnaTrace(Trace):
 
     @property
     def half_extent_asymmetry(self) -> float:
-        """Half-extent asymmetry comparing left and right halves of a trace.
+        """Half-extent asymmetry comparing the 5' and 3' halves of a trace.
 
-        The metric compares the spatial extent of the left and right halves
-        by their radii of gyration, returning the normalized difference:
+        The metric compares the spatial extent of the 5' and 3' halves by
+        their radii of gyration, returning the normalized difference:
 
-            (Rg_right - Rg_left) / (Rg_right + Rg_left)
+            (Rg_3 - Rg_5) / (Rg_3 + Rg_5)
 
-        where Rg_left and Rg_right are `two_halves.gyration_radius_5` (the
-        first floor(N/2) points) and `two_halves.gyration_radius_3` (the last
+        where Rg_5 and Rg_3 are `two_halves.gyration_radius_5` (the first
+        floor(N/2) points) and `two_halves.gyration_radius_3` (the last
         floor(N/2) points), so for odd N the middle point is left out. The
-        metric is signed: positive values indicate the right half is more
-        extended, negative values indicate the left half is more extended.
-        "Left" is the half with the earlier valid timepoints; whether that is
-        the 5' or the 3' half depends on the probe design. Values are
-        typically in the range (-1, 1) when radii are positive and finite.
+        metric is signed: positive values indicate the 3' half is more
+        extended, negative values indicate the 5' half is more extended.
+        Values are typically in the range (-1, 1) when radii are positive and
+        finite. 5' and 3' follow the order of `valid_timepoints` (see `Trace`).
 
         Each Rg is computed over the available spots of its half.
 
@@ -549,10 +560,10 @@ class RnaTrace(Trace):
             float: The half-extent asymmetry, or ``numpy.nan`` if a half has no
                 available spot or both radii are zero.
         """
-        rg_left, rg_right = self.two_halves.gyration_radius_5, self.two_halves.gyration_radius_3
-        if rg_right + rg_left == 0:
+        rg_5, rg_3 = self.two_halves.gyration_radius_5, self.two_halves.gyration_radius_3
+        if rg_3 + rg_5 == 0:
             return np.nan
-        return float((rg_right - rg_left) / (rg_right + rg_left))
+        return float((rg_3 - rg_5) / (rg_3 + rg_5))
 
     @property
     def end_to_end_distance(self) -> float:
@@ -714,10 +725,10 @@ class RnaTrace(Trace):
 
         Args:
             mode: One of the following:
-                "anchor_5": Distances from the first valid timepoint
-                    (index 0) to each later timepoint.
-                "anchor_3": Distances from the last valid timepoint
-                    (last index) to each earlier timepoint.
+                "anchor_5": Distances from the 5' end (the first valid
+                    timepoint) to each later timepoint.
+                "anchor_3": Distances from the 3' end (the last valid
+                    timepoint) to each earlier timepoint.
                 "all": All pairwise distances grouped by genomic/timepoint
                     separation.
                 "agg": One aggregated distance per separation, using
@@ -734,10 +745,7 @@ class RnaTrace(Trace):
                 input (before imputation).
 
         Note:
-            The mode names assume the first valid timepoint is the 5' end.
-            Which end it is depends on the probe design (the order in which
-            segments are imaged); when it is the 3' end, "anchor_5" anchors
-            at the 3' end and "anchor_3" at the 5' end.
+            5' and 3' follow the order of `valid_timepoints` (see `Trace`).
         """
         mtx = self.distance_matrix
         n = mtx.shape[0]
