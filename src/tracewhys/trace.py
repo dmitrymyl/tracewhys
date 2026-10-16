@@ -7,7 +7,7 @@ import pandas as pd
 from numpy.typing import ArrayLike, NDArray
 from scipy import stats
 from scipy.spatial import ConvexHull, QhullError
-from scipy.spatial.distance import pdist, squareform
+from scipy.spatial.distance import cdist, pdist, squareform
 
 
 def _coord_cols_for_dim(dim: Literal['2d', '3d']) -> list[str]:
@@ -845,18 +845,23 @@ class SisterTrace:
     has its own set of valid timepoints, and missing coordinates are imputed
     only within a subtrace -- never across the cut site or between sisters.
 
+    The left side lies 5' of the cut site and the right side 3' of it, along
+    the genome and identically on both sisters. As for `Trace`, each of the
+    four timepoint lists is ordered 5' to 3', so a left list ends at the cut
+    site and a right list starts at it.
+
     Args:
         df (pd.DataFrame): Input coordinate measurements with a `timepoint`
             column and coordinate columns (`x`, `y`, [`z`] for 3D). May
             contain missing values.
-        s1_left_timepoints (Sequence[int]): Valid timepoints for sister1, left
-            of the cut site.
-        s1_right_timepoints (Sequence[int]): Valid timepoints for sister1,
-            right of the cut site.
-        s2_left_timepoints (Sequence[int]): Valid timepoints for sister2, left
-            of the cut site.
-        s2_right_timepoints (Sequence[int]): Valid timepoints for sister2,
-            right of the cut site.
+        s1_left_timepoints (Sequence[int]): Valid timepoints for sister1, 5'
+            of the cut site (left), in 5'-to-3' order.
+        s1_right_timepoints (Sequence[int]): Valid timepoints for sister1, 3'
+            of the cut site (right), in 5'-to-3' order.
+        s2_left_timepoints (Sequence[int]): Valid timepoints for sister2, 5'
+            of the cut site (left), in 5'-to-3' order.
+        s2_right_timepoints (Sequence[int]): Valid timepoints for sister2, 3'
+            of the cut site (right), in 5'-to-3' order.
         dim (str): Coordinate dimensionality, either '2d' or '3d'.
         impute (bool): If True, linearly impute interior missing coordinates
             within each subtrace.
@@ -865,11 +870,22 @@ class SisterTrace:
 
     Attributes:
         df (pd.DataFrame): Combined dataframe (concatenation of the four
-            subtraces' data, sorted by timepoint), with `sister` and `side`
-            columns tagging each row and an `original_present` column
-            marking rows present before imputation.
+            subtraces' data, sorted by timepoint, i.e. in imaging order), with
+            `sister` and `side` columns tagging each row and an
+            `original_present` column marking rows present before imputation.
         dim (str): Coordinate dimensionality ('2d' or '3d').
         metadata (dict | None): Trace metadata if provided.
+
+    Notes:
+        - Outputs come in one of two orders:
+            - imaging order (sorted by timepoint): `df`, `distance_matrix`,
+              `original_timepoint_mask` and `get_original_timepoint_mask`;
+            - molecule order (each sister's left list, then its right list,
+              5' to 3' across the cut site): `sister1_dist_mtx`,
+              `sister2_dist_mtx` and `trans_dist_mtx`.
+          The two coincide only if each sister's timepoints are imaged in
+          5'-to-3' order, so masks in imaging order do not line up with the
+          sister matrices in general.
     """
     _SISTERS = ('sister1', 'sister2')
     _SIDES = ('left', 'right')
@@ -945,8 +961,9 @@ class SisterTrace:
         """Concatenate the four subtraces' data into one dataframe, tagged by subtrace.
 
         Returns:
-            pd.DataFrame: Rows from all four subtraces, sorted by timepoint,
-                with `sister` and `side` columns identifying subtrace membership
+            pd.DataFrame: Rows from all four subtraces, sorted by timepoint
+                (imaging order, not molecule order), with `sister` and `side`
+                columns identifying subtrace membership
                 and an `original_present` column holding each subtrace's
                 `original_timepoint_mask`.
         """
@@ -998,8 +1015,9 @@ class SisterTrace:
 
         Returns:
             np.ndarray: 1-D boolean array aligned with the rows of `df` (and
-                therefore with `distance_matrix`). True indicates the coordinate
-                was present in the original pre-imputation input.
+                therefore with `distance_matrix`), in imaging order. True
+                indicates the coordinate was present in the original
+                pre-imputation input.
         """
         return self.df['original_present'].to_numpy(dtype=bool)
 
@@ -1012,7 +1030,9 @@ class SisterTrace:
 
         Returns:
             np.ndarray: 1-D boolean array aligned with the rows of the selected
-                subset of `df`, sorted by timepoint.
+                subset of `df`, sorted by timepoint (imaging order). It does
+                not, in general, line up with the sister matrices, which are
+                in molecule order (see Notes of `SisterTrace`).
         """
         return self._subset_df(sister, side)['original_present'].to_numpy(dtype=bool)
 
@@ -1120,34 +1140,59 @@ class SisterTrace:
         """Pairwise Euclidean distance matrix across all four subtraces.
 
         Returns:
-            np.ndarray: Symmetric (n x n) matrix of pairwise distances.
+            np.ndarray: Symmetric (n x n) matrix of pairwise distances, with
+                rows and columns aligned with the rows of `df` (imaging order).
         """
         if self._distance_matrix is None:
             coords = self.df[self._coord_cols].to_numpy()
             self._distance_matrix = squareform(pdist(coords, metric='euclidean'))
         return self._distance_matrix
 
-    def _sister_mask(self, sister: str) -> NDArray[np.bool_]:
-        return (self.df['sister'] == sister).to_numpy()
+    def _sister_coords(self, sister: str) -> NDArray[np.float64]:
+        """Coordinates of one sister in molecule order.
+
+        Returns:
+            np.ndarray: The left subtrace's coordinates followed by the right
+                subtrace's, each in the order of its timepoint list (5' to 3').
+        """
+        return np.vstack([self._subtraces[(sister, side)]._coords for side in self._SIDES])
 
     @property
     def sister1_dist_mtx(self) -> NDArray[np.float64]:
-        """Pairwise distance matrix restricted to sister1 (both sides)."""
-        mask = self._sister_mask('sister1')
-        return self.distance_matrix[np.ix_(mask, mask)]
+        """Pairwise distance matrix of sister1 (both sides), in molecule order.
+
+        Returns:
+            np.ndarray: Symmetric matrix whose rows and columns follow
+                `s1_left_timepoints` then `s1_right_timepoints`, i.e. 5' to 3'
+                across the cut site. Rows and columns of missing spots are
+                `numpy.nan`.
+        """
+        return squareform(pdist(self._sister_coords('sister1'), metric='euclidean'))
 
     @property
     def sister2_dist_mtx(self) -> NDArray[np.float64]:
-        """Pairwise distance matrix restricted to sister2 (both sides)."""
-        mask = self._sister_mask('sister2')
-        return self.distance_matrix[np.ix_(mask, mask)]
+        """Pairwise distance matrix of sister2 (both sides), in molecule order.
+
+        Returns:
+            np.ndarray: Symmetric matrix whose rows and columns follow
+                `s2_left_timepoints` then `s2_right_timepoints`, i.e. 5' to 3'
+                across the cut site. Rows and columns of missing spots are
+                `numpy.nan`.
+        """
+        return squareform(pdist(self._sister_coords('sister2'), metric='euclidean'))
 
     @property
     def trans_dist_mtx(self) -> NDArray[np.float64]:
-        """Pairwise distances between sister1 and sister2, spanning the whole trace."""
-        mask1 = self._sister_mask('sister1')
-        mask2 = self._sister_mask('sister2')
-        return self.distance_matrix[np.ix_(mask1, mask2)]
+        """Pairwise distances between sister1 and sister2, in molecule order.
+
+        Returns:
+            np.ndarray: Matrix with rows following sister1 and columns
+                following sister2, each in the order of `sister1_dist_mtx`
+                and `sister2_dist_mtx` (5' to 3' across the cut site). Rows
+                and columns of missing spots are `numpy.nan`.
+        """
+        return cdist(self._sister_coords('sister1'), self._sister_coords('sister2'),
+                     metric='euclidean')
 
     @property
     def cut_end_dist_mtx(self) -> NDArray[np.float64]:
@@ -1155,7 +1200,9 @@ class SisterTrace:
 
         The four points are the timepoint nearest the cut site on each of the
         four subtraces: the last timepoint of each `left` subtrace and the
-        first timepoint of each `right` subtrace.
+        first timepoint of each `right` subtrace. These are nearest the cut
+        site only because each timepoint list is ordered 5' to 3' (see
+        `SisterTrace`).
 
         Returns:
             np.ndarray: Symmetric (4 x 4) matrix of pairwise distances, in the
