@@ -58,7 +58,7 @@ class Trace:
 
     Notes:
         - Properties prefixed with `original_` refer to the pre-imputation state.
-        - Metrics are computed from the placed spots (detected, or imputed when
+        - Metrics are computed from the available spots (detected, or imputed when
           `impute=True`); spots still missing are left out. A metric is
           `numpy.nan` only when too few spots remain for it to be defined.
         - A trace missing an end spot covers a shorter stretch of the molecule,
@@ -294,7 +294,7 @@ class Trace:
         return bool(np.isnan(self._coords).any())
 
     @property
-    def placed_timepoint_mask(self) -> NDArray[np.bool_]:
+    def available_timepoint_mask(self) -> NDArray[np.bool_]:
         """Boolean mask of timepoints that have a position in the current `df`.
 
         Returns:
@@ -305,22 +305,22 @@ class Trace:
         return ~np.isnan(self._coords).any(axis=1)
 
     @property
-    def placed_count(self) -> int:
+    def available_count(self) -> int:
         """Number of timepoints that have a position in the current `df`.
 
         Returns:
             int: Count of detected spots, plus imputed spots when `impute=True`.
         """
-        return int(self.placed_timepoint_mask.sum())
+        return int(self.available_timepoint_mask.sum())
 
     @property
-    def _placed_coords(self) -> NDArray[np.float64]:
-        """Coordinates of the placed spots, in timepoint order.
+    def _available_coords(self) -> NDArray[np.float64]:
+        """Coordinates of the available spots, in timepoint order.
 
         Returns:
-            np.ndarray: Array of shape (placed_count, n_dimensions).
+            np.ndarray: Array of shape (available_count, n_dimensions).
         """
-        return self._coords[self.placed_timepoint_mask]
+        return self._coords[self.available_timepoint_mask]
 
     @staticmethod
     def _has_missing_values(arr: ArrayLike) -> bool:
@@ -370,10 +370,10 @@ class Trace:
 
     @property
     def gyration_radius(self) -> float:
-        """Radius of gyration of the placed spots.
+        """Radius of gyration of the available spots.
 
         Returns:
-            float: Computed radius of gyration, or `numpy.nan` if no spot is placed.
+            float: Computed radius of gyration, or `numpy.nan` if no spot is available.
         """
         if self._gyration_radius is None:
             self._gyration_radius = self._compute_gyration_radius(self._coords, nan_policy='omit')
@@ -406,7 +406,7 @@ class TwoHalves:
         Rg^2 = u R5^2 + (1 - u) R3^2 + u (1 - u) D^2
 
     where `Rg` is the radius of gyration of the spots of both halves. Each half
-    uses its placed spots and `u` is computed over the placed spots, so for
+    uses its available spots and `u` is computed over the available spots, so for
     even N `Rg` is the trace's `gyration_radius`; for odd N it leaves out the
     middle spot. As for the "anchor_5" mode of `RnaTrace.get_scaling_table`,
     the first valid timepoint is taken to be the 5' end.
@@ -426,7 +426,7 @@ class TwoHalves:
 
     @classmethod
     def nan(cls) -> 'TwoHalves':
-        """Decomposition with all fields `numpy.nan`, for when a half has no placed spot."""
+        """Decomposition with all fields `numpy.nan`, for when a half has no available spot."""
         return cls(np.nan, np.nan, np.nan, np.nan)
 
 
@@ -450,23 +450,23 @@ class RnaTrace(Trace):
           `original_timepoint_mask`, dropout indicators (`original_missing_count`,
           `has_original_missing_left_edge`, ...), `gyration_radius`,
           `distance_matrix`, etc.
-        - Each metric uses the placed spots it can, and is `numpy.nan` only when
+        - Each metric uses the available spots it can, and is `numpy.nan` only when
           it is not defined for them:
-            - `gyration_radius`: the placed spots; needs at least 1;
-            - `asphericity`: the placed spots; needs at least 2 not all at the
+            - `gyration_radius`: the available spots; needs at least 1;
+            - `asphericity`: the available spots; needs at least 2 not all at the
               same position;
-            - convex hull metrics: the placed spots; needs 3 non-collinear
+            - convex hull metrics: the available spots; needs 3 non-collinear
               spots in 2D, 4 non-coplanar in 3D;
-            - `scaling_exponent`: the pairs of placed spots, at their separation
-              along the trace (not their rank among the placed spots); needs at
+            - `scaling_exponent`: the pairs of available spots, at their separation
+              along the trace (not their rank among the available spots); needs at
               least 2 distinct separations;
             - `two_halves` (two-halves decomposition of the squared radius of
-              gyration, see `TwoHalves`): the placed spots of the 5' and 3'
+              gyration, see `TwoHalves`): the available spots of the 5' and 3'
               halves, with halves still defined by position along the trace;
-              needs at least 1 placed spot per half;
+              needs at least 1 available spot per half;
             - `half_extent_asymmetry`: built from the radii of gyration of
               `two_halves`; also needs a nonzero radius in one of them;
-            - `contour_length`: the placed spots joined in timepoint order, so
+            - `contour_length`: the available spots joined in timepoint order, so
               interior gaps are bridged by straight lines and missing end spots
               truncate it;
             - `end_to_end_distance` is `numpy.nan` when an end spot is missing.
@@ -506,14 +506,15 @@ class RnaTrace(Trace):
 
         Returns:
             TwoHalves: The decomposition, with all fields ``numpy.nan`` if a
-                half has no placed spot.
+                half has no available spot.
         """
         if self._two_halves is None:
             self._two_halves = TwoHalves.nan()
             coords = self._coords
-            placed = self.placed_timepoint_mask
+            available = self.available_timepoint_mask
             N = coords.shape[0]
-            halves = [coords[:N // 2][placed[:N // 2]], coords[N - N // 2:][placed[N - N // 2:]]]
+            halves = [coords[:N // 2][available[:N // 2]],
+                      coords[N - N // 2:][available[N - N // 2:]]]
             if all(len(half) > 0 for half in halves):
                 five, three = halves
                 self._two_halves = TwoHalves(
@@ -542,11 +543,11 @@ class RnaTrace(Trace):
         the 5' or the 3' half depends on the probe design. Values are
         typically in the range (-1, 1) when radii are positive and finite.
 
-        Each Rg is computed over the placed spots of its half.
+        Each Rg is computed over the available spots of its half.
 
         Returns:
             float: The half-extent asymmetry, or ``numpy.nan`` if a half has no
-                placed spot or both radii are zero.
+                available spot or both radii are zero.
         """
         rg_left, rg_right = self.two_halves.gyration_radius_5, self.two_halves.gyration_radius_3
         if rg_right + rg_left == 0:
@@ -569,31 +570,31 @@ class RnaTrace(Trace):
     def contour_length(self) -> float:
         """Total contour length computed as the sum of consecutive segment lengths.
 
-        Missing spots are skipped: the placed spots are joined in timepoint
+        Missing spots are skipped: the available spots are joined in timepoint
         order, so an interior gap is bridged by a straight line (the same length
         as with `impute=True`) and missing end spots truncate the contour.
 
         Returns:
-            float: Sum of distances between successive placed spots, or
-                `numpy.nan` if no spot is placed.
+            float: Sum of distances between successive available spots, or
+                `numpy.nan` if no spot is available.
         """
-        coords = self._placed_coords
+        coords = self._available_coords
         if len(coords) == 0:
             return np.nan
         return float(np.linalg.norm(np.diff(coords, axis=0), axis=1).sum())
 
     @property
     def convex_hull(self) -> ConvexHull | None:
-        """Convex hull of the placed spots.
+        """Convex hull of the available spots.
 
         Returns:
             scipy.spatial.ConvexHull or None: ConvexHull object, or None if the
-                placed spots are too few or degenerate (e.g. collinear in 2D).
+                available spots are too few or degenerate (e.g. collinear in 2D).
         """
         if self._convex_hull is None:
             try:
-                self._convex_hull = ConvexHull(self._placed_coords)
-            except (QhullError, ValueError):  # ValueError when no spot is placed
+                self._convex_hull = ConvexHull(self._available_coords)
+            except (QhullError, ValueError):  # ValueError when no spot is available
                 return None
         return self._convex_hull
 
@@ -686,10 +687,10 @@ class RnaTrace(Trace):
         Larger values indicate a more anisotropic distribution of mass.
 
         Returns:
-            float: Asphericity value over the placed spots, or ``numpy.nan`` if
-                fewer than 2 are placed or all lie at the same position.
+            float: Asphericity value over the available spots, or ``numpy.nan`` if
+                fewer than 2 are available or all lie at the same position.
         """
-        c = self._placed_coords
+        c = self._available_coords
         if len(c) < 2:
             return np.nan
         d = c.shape[1]                 # Auto-detects dimension (2 or 3)
@@ -781,7 +782,7 @@ class RnaTrace(Trace):
     def scaling_exponent(self) -> float:
         """Slope of log10(distance) against log10(separation) over all pairs.
 
-        Only pairs whose two spots are placed are used, each at its separation
+        Only pairs whose two spots are available are used, each at its separation
         along the trace.
 
         Returns:
@@ -814,7 +815,7 @@ class RnaTrace(Trace):
         dropouts_info = dict(complete=self.is_complete,
                              missing_count=self.original_missing_count,
                              present_count=self.original_present_count,
-                             placed_count=self.placed_count,
+                             available_count=self.available_count,
                              consecutive_missing=self.has_original_consecutive_missing_timepoints,
                              missing_left_edge=self.has_original_missing_left_edge,
                              missing_right_edge=self.has_original_missing_right_edge,
@@ -1098,8 +1099,8 @@ class SisterTrace:
             side: One of "both", "left", "right".
 
         Returns:
-            float: Radius of gyration over the placed spots of the subset, or
-                `numpy.nan` if none is placed.
+            float: Radius of gyration over the available spots of the subset, or
+                `numpy.nan` if none is available.
         """
         self._validate_sister_side(sister, side)
         if sister != 'both' and side != 'both':
